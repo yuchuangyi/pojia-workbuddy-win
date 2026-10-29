@@ -1,6 +1,6 @@
+# 默认统一文本处理
+* text=auto
+
 # 批处理按字节存（CRLF），保证从网页 Download ZIP 下来的 .bat 双击就能跑
 *.bat -text
 *.cmd -text
-
-# 其余文本统一 LF 入库
-* text=auto
