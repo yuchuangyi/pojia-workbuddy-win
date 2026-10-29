@@ -85,9 +85,13 @@ def _install_from_process() -> Path | None:
 
 
 def detect_install() -> Path:
+    """返回安装目录。ENV_INVALID 标记"用户显式指定了 WB_INSTALL 但那个路径不成立"。"""
+    global ENV_INVALID
     env = os.environ.get("WB_INSTALL")
-    if env and _is_install(env):
-        return Path(env)
+    if env:
+        if _is_install(env):
+            return Path(env)
+        ENV_INVALID = True
     for c in INSTALL_CANDIDATES:
         if _is_install(c):
             return c
@@ -97,6 +101,7 @@ def detect_install() -> Path:
     return Path(env) if env else DEFAULT_INSTALL
 
 
+ENV_INVALID = False
 INSTALL = detect_install()
 RES = INSTALL / "resources"
 APP_UNPACKED = RES / "app.asar.unpacked"
@@ -346,8 +351,12 @@ def targets() -> list[dict]:
     pd = persona_dir()
     t: list[dict] = [{"layer": "L0", "kind": "json", "path": APPCFG, "name": "customPrompt 槽"}]
     for p in plugin_prompts():
-        # 缓存里的路径带版本号，名字里带上以便辨认
-        label = f"welcomemode/{p.parent.parent.name if p.parent.parent.name.startswith('welcomemode-') else p.parent.name}"
+        # 缓存里的路径是 …/welcomemode-<mode>/<版本>/prompt.tpl，label 带上模式与版本前 8 位
+        parent = p.parent
+        if parent.parent.name.startswith("welcomemode-"):
+            label = f"{parent.parent.name}/{parent.name[:8]}"
+        else:
+            label = f"welcomemode/{parent.name}"
         t.append({"layer": "L8", "kind": "policy", "path": p, "name": label})
     for p in tpl_files():
         t.append({"layer": "L1", "kind": "policy", "path": p, "name": p.name})
@@ -438,6 +447,11 @@ def is_loaded(tgt: dict) -> bool:
 # ---------------------------------------------------------------- 前置检查
 
 def require_install() -> bool:
+    if ENV_INVALID:
+        print(f"WB_INSTALL 指定的目录无效：{os.environ.get('WB_INSTALL')}")
+        print(f"  缺少：{Path(os.environ.get('WB_INSTALL', '')) / 'resources' / 'app.asar.unpacked'}")
+        print("  要么改成正确的安装目录，要么清掉这个环境变量让脚本自己探测。")
+        return False
     if _is_install(INSTALL):
         return True
     print(f"安装目录无效：{INSTALL}")
@@ -471,7 +485,9 @@ def cmd_status(_a) -> int:
     seal = load_seal()
     files = seal.get("files", {})
     rt = runtime_ref()
-    print(f"安装目录   : {INSTALL}{'' if _is_install(INSTALL) else '   ← 无效！'}")
+    print(f"安装目录   : {INSTALL}"
+          + ("   ← WB_INSTALL 指向的目录无效，这是自动探测的结果" if ENV_INVALID
+             else "" if _is_install(INSTALL) else "   ← 无效！"))
     print(f"插件缓存   : {PLUGIN_CACHE}  ({'存在' if PLUGIN_CACHE.exists() else '不存在'})")
     print(f"人格目录   : {persona_dir()}")
     print(f"封条文件   : {SEAL}  ({'存在' if SEAL.exists() else '尚未建立'})")
@@ -563,6 +579,7 @@ def cmd_apply(a) -> int:
             if kind == "skill":
                 after = SKILL_MD.encode("utf-8")
                 before = b"" if created else pristine
+                extra = {}
             elif kind == "json":
                 before = pristine
                 data = json.loads(pristine.decode("utf-8")) if pristine else {}
@@ -696,42 +713,33 @@ def _generation_bodies(limit=6) -> list[tuple[Path, str]]:
 
 
 def cmd_inspect(_a) -> int:
-    """载荷有没有真的进请求 —— 唯一可信的验收。"""
+    """载荷有没有真的进请求 —— 唯一可信的验收。只看最新的那个 trace。"""
     bodies = _generation_bodies()
     if not bodies:
         print("最近 6 个 trace 里没有 generation 请求体。先重启 WorkBuddy 并新开一个对话。")
         return 1
-    probes = {
-        "L8/L1 新policy": "single-operator workstation",
-        "L8/L1 旧policy": "You MUST refuse any request that violates laws",
-        "L2 新identity": "operator's own workstation",
-        "L0 customPrompt": "交付偏好：结论先行",
-        "L3 SOUL": "环境与交付偏好",
-        "L6 MEMORY": "环境备忘",
-    }
-    # 只看含系统提示的请求体，避免把纯工具调用算进来
-    sample = [ti for _, ti in bodies if "<content_policy>" in ti]
-    if not sample:
-        sample = [ti for _, ti in bodies]
-    print(f"样本：{len(sample)} 份请求体（来自 {len({str(t) for t, _ in bodies})} 个 trace）\n")
-    verdict = {}
-    for label, needle in probes.items():
-        n = sum(needle in ti for ti in sample)
-        verdict[label] = n
-        print(f"{label:<16} {n:>3} / {len(sample)}")
+    latest = bodies[0][0]                      # 按 mtime 倒序，第一个就是最新 trace
+    items = [ti for tr, ti in bodies if tr == latest]
+    sample = [ti for ti in items if "<content_policy>" in ti] or items
+    stamp = time.strftime("%m-%d %H:%M:%S", time.localtime(latest.stat().st_mtime))
+    print(f"样本：{len(sample)} 份请求体（{latest.name}，{stamp}）\n")
+    new_policy = sum("single-operator workstation" in ti for ti in sample)
+    old_policy = sum("You MUST refuse any request that violates laws" in ti for ti in sample)
+    print(f"{'L8/L1 新policy':<16} {new_policy:>3} / {len(sample)}")
+    print(f"{'L8/L1 旧policy':<16} {old_policy:>3} / {len(sample)}")
     print()
-    new_policy = verdict["L8/L1 新policy"]
-    old_policy = verdict["L8/L1 旧policy"]
     if new_policy and not old_policy:
         print("判定：L1/L8 已进入请求（新 policy 在，旧 policy 不在）。")
+        print("说明：L0/L2/L3–L6 在请求体后半段，trace 只留了前 ~20000 字，这里看不到属正常。")
         return 0
     if old_policy and not new_policy:
         print("判定：L1/L8 未进入请求 —— 请求里还是原厂 policy。")
         print("      查 ~/.workbuddy/plugins/cache/workbuddy-builtin/welcomemode-*/<版本>/prompt.tpl")
         print("      那才是 welcomeMode 真正加载的文件；改完要完全退出 WorkBuddy 再启动。")
         return 3
-    print("判定：新旧都没命中 —— 请求体可能被截断，换一个会话再跑。")
-    return 1
+    print(f"判定：新旧混杂（新 {new_policy} / 旧 {old_policy}）—— 这个 trace 跨了改动前后。")
+    print("      完全退出 WorkBuddy 再启动，新开一个对话后重新跑本命令。")
+    return 2
 
 
 def cmd_trace(_a) -> int:
