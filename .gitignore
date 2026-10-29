@@ -1,0 +1,10 @@
+# 备份目录：WorkBuddy 原厂提示词与人格文件全文，不公开分发
+backup/
+seal.json
+
+# Python
+__pycache__/
+*.pyc
+
+# 本地临时
+*.log
