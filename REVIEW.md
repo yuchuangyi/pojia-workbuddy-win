@@ -529,3 +529,67 @@ L8/L1 旧policy      0 / 20
 - `structure_check.py` 并入 `verify --struct`（P2-8）：模板结构体检还得单独跑。
 - `tools/*.py` 的 cwd 依赖（P2-4）：没改，README 里注明「必须在根目录跑」。
 - 单元测试（P2-12）：本次验证靠 shell 脚本 + 真机 dry-run，没有落成 `tests/`。要长期维护的话建议补上 `_in_place` 的 CRLF/LF 双分支和 `render(policy)` 的无标签分支。
+
+---
+
+## v3.1 · 2026-10-29 · 安装体验（不改载荷，只改"别人能不能装上"）
+
+v3 的装载逻辑没动，改的是入口与自检。目标：把「读 README 敲六条命令 + 自己设环境变量」压成「双击一个 bat」。
+
+### 改了什么
+
+| 位置 | 改动 | 解决的问题 |
+|---|---|---|
+| `pojia.py` | 新增 `setup`：六步向导（版本 → 目录 → 权限 → 进程 → 靶点 → 预演+装载） | 首次安装零参数，装错目录当场停 |
+| `pojia.py` | 新增 `doctor`：15 项自检，关键项失败退出码 2 | 远程求助时贴一段输出即可定位 |
+| `pojia.py` | 新增 `pojia.config.json`，解析顺序 `WB_INSTALL → config → 常见路径 → 进程反查` | 不再要求用户配环境变量 |
+| `pojia.py` | `EXPLICIT_INVALID` 取代 `ENV_INVALID`：env 与 config 两个显式来源都记录原因 | 显式指错时给出更准的话术 |
+| `pojia.py` | `apply` 前查 `WorkBuddy.exe`，在跑就告警（`--allow-running` / `--yes` 可越过，dry-run 不拦） | 消除"装了没生效"的第一大来源 |
+| `pojia.py` | `dw()` / `pad()`：按东亚字符宽度对齐表格 | 中文表格列错位 |
+| `install.bat` `doctor.bat` `check.bat` `restore.bat` `_find_py.bat` | 纯 ASCII + CRLF；`chcp 65001`；`_find_py.bat` 找 3.9+ 并回传 `PY` | 双击即装，不用记命令；无 Python 时给 winget 命令 |
+| `README.md` | 重写成「三步装完 + 退出码对照 + 装不上怎么查 + 哪些文件不能删」 | 原版按命令讲，非开发用户读不下去 |
+| `DETAILS.md` | 新增 §0（setup 六步与解析优先级）、§1.7（bat 闪退 / 找不到 Python 对照表）；§1.2 §1.5 §1.6 改用 doctor 与 config | 排查路径与实现一致 |
+| `.gitignore` | 忽略 `pojia.config.json` | 每台机器路径不同，不该进仓库 |
+
+### 回归记录（真机 + 临时副本）
+
+| # | 场景 | 命令 | 结果 |
+|---|---|---|---|
+| 1 | 真机全装载态 | `setup --dry-run --yes` | 退出码 0，`将写入 0 个靶点 / 34 已是目标态`，未生成 `pojia.config.json` |
+| 2 | 真机全装载态 | `setup --yes` | 退出码 0，0 写入；生成 config `{"install": "D:\\AppStoreSoftstore\\WorkBuddy"}` |
+| 3 | 新克隆（无 seal） | `setup --dry-run --yes` | 退出码 3，命中"已是改装态但无封条"拦截，未写任何文件 |
+| 4 | 新克隆 + 上级目录有 seal | `setup --yes` | 输出 `已复用 D:\tmp\seal.json`，随后 0 写入，退出码 0 |
+| 5 | 显式目录不存在 | `WB_INSTALL=C:\nonexistent\WorkBuddy status` | 显示"显式配置无效（WB_INSTALL=…），这是自动探测结果"，回落到正确目录 |
+| 6 | `--install` 指错 | `setup --install C:\nope --yes` | 退出码 2，指出缺 `resources\app.asar.unpacked` |
+| 7 | 程序在跑时 dry-run | `apply --dry-run` | 只告警不阻塞，退出码 0 |
+| 8 | 四个 bat 实跑 | `install.bat --dry-run`、`doctor.bat`、`check.bat` | 中文输出正常，退出码 0；`check.bat` 打出 `34 一致 / 0 异常` 与 `[OK]` |
+| 9 | bat 传参链路 | `restore.bat --bogus` | argparse 先拒（退出码 2），未触碰任何文件 |
+| 10 | Python 3.9 语法 | `D:\conda\python.exe -m py_compile pojia.py` | 通过（3.9.13） |
+
+`restore` 未做真实还原测试（会动真机全装载态），只验了传参链路——需要时在隔离目录用假靶点补。
+
+### 补丁：路径自适应 + 双击即装（同日）
+
+| 改动 | 说明 |
+|---|---|
+| `detect_install` 六层探测 | `WB_INSTALL` → `pojia.config.json` → 标准安装位 → 卸载注册表（HKCU/HKLM × 64/32，`DisplayIcon` / `InstallLocation`）→ 运行中进程（`wmic`，退 PowerShell）→ 本地盘两层扫描。删除写死的 `D:\AppStoreSoftstore\WorkBuddy` 默认值 |
+| `coerce_install` | exe / `...\resources` / `...\app.asar.unpacked` / 引号 / `%VAR%` / `file:///` 都往上找，最多四层 |
+| `EXPLICIT_STALE` | 配置里的路径失效时**继续往下探测**并提示"已自动改用 X"，只有全部失败才用 `EXPLICIT_INVALID` 拦 |
+| `resolve_user_dir` | 数据目录自适应：`WB_HOME` / `WORKBUDDY_HOME` → 配置 `user_dir` → `~/.workbuddy` → `%APPDATA%` / `%LOCALAPPDATA%` / `~` 下的 `workbuddy` |
+| `_fill` + `{SCOPE}` | 载荷里唯一的绝对路径改为按 `HERE/scope/redteam-scope.md` 填充；本机渲染结果与原写死字节一致（`apply --dry-run` 仍 0 写入） |
+| `backup_path` | 跨盘 / UNC 也不撞名，取不到相对路径时退化为哈希目录 |
+| `install.bat` | 改为 `setup --yes --close`：零提问、自动关程序（3 秒倒计时），双击即装完 |
+| `_find_py.bat` | 追加便携版 `.\python\python.exe` 与 `%LOCALAPPDATA%\Programs\Python\Python3*` |
+| `tools/_locate.py` | `check_backup` / `char_delta` / `structure_check` 改为从脚本位置上找 `seal.json`，不再依赖 cwd |
+| `README.md` | 压到一屏：三步表 + 三个常见错误 + 还原 |
+
+新增回归：
+
+| 场景 | 结果 |
+|---|---|
+| 无 `pojia.config.json` 时的探测 | 走注册表命中 `注册表：WorkBuddy 5.9.3` → `D:\AppStoreSoftstore\WorkBuddy` |
+| 配置指向失效路径 | `status` 显示「原配置已失效 … 已自动改用上面这个」，实际走注册表命中（探测链路同下一条） |
+| `--install` 贴 exe 路径 | 接受并归一到安装目录 |
+| 三支 tools 从 `/tmp` 与 `tools/` 运行 | 均正常（`备份完整性: ok` / `结构体检: 全部通过`） |
+| 载荷字节 | `apply --dry-run` 仍 `0 个靶点写入，34 个已是目标态` |
+| `install.bat --dry-run` | 中文正常、零提问、退出码 0（未触发关闭程序） |

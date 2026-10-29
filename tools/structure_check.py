@@ -5,7 +5,9 @@ import json
 import pathlib
 import re
 
-seal = json.load(open("seal.json", encoding="utf-8"))
+from _locate import seal_path
+
+seal = json.load(open(seal_path(), encoding="utf-8"))
 bad = 0
 for key, rec in seal["files"].items():
     if not key.endswith(".tpl"):

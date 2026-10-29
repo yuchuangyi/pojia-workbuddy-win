@@ -2,6 +2,9 @@
 backup/
 seal.json
 
+# 安装向导写下的本机路径（每台机器不一样，不进仓库）
+pojia.config.json
+
 # Python
 __pycache__/
 *.pyc

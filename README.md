@@ -1,127 +1,68 @@
-# pojia-workbuddy-win · 安装
+# pojia-workbuddy-win
 
-Windows 桌面版 WorkBuddy 的提示词层装载器。三步：`status` 看 → `apply` 装 → `inspect` 验。
+**双击 `install.bat` 就装完。** 不用敲命令，不用配环境变量。
 
-## 1 前置
+装之前只有一件事：WorkBuddy **桌面版至少启动过一次**（脚本要读它启动时生成的插件缓存）。
 
-- WorkBuddy **桌面版**（不是网页版），确认安装目录：
+## 三步
 
-  ```powershell
-  (Get-Process WorkBuddy -EA SilentlyContinue | Select-Object -First 1).Path
-  ```
+| # | 做什么 | 看到什么算成功 |
+|---|---|---|
+| 1 | 双击 **`install.bat`** | 最后一行 `装完了。接下来三步…` |
+| 2 | 完全退出 WorkBuddy，再打开，随便发一句话 | — |
+| 3 | 双击 **`check.bat`** | `[OK] Installed and effective.` |
 
-  返回 `D:\AppStoreSoftstore\WorkBuddy\WorkBuddy.exe` 这类路径，**父目录**就是安装目录。安装目录里必须有 `resources\app.asar.unpacked`，不是 `%APPDATA%\WorkBuddy` 那种数据目录。
+第 2 步不能跳：模板是**启动时**读进内存的，只新开对话读不到。
 
-- Python 3.9+。纯标准库，**不用 pip install**。
-
-  ```powershell
-  python --version
-  ```
-
-- **完全退出 WorkBuddy**（任务管理器确认进程没了）。程序开着改，`customPrompt` 那一层会被它退出时重写掉。
-
-## 2 选一个目录放脚本，之后别换
-
-```powershell
-cd D:\
-git clone https://github.com/yuchuangyi/pojia-workbuddy-win.git workbuddy-pojia
-cd D:\workbuddy-pojia
-```
-
-脚本把 `seal.json`（封条）和 `backup\`（原厂备份）存在自己所在目录。这两个在 `.gitignore` 里，`git clone` 不带过来——**一台机器只留一份工作副本，别另克隆第二份再跑 `apply`**（会被拒绝执行，见第 7 步）。
-
-## 3 指定安装目录
-
-脚本默认 `D:\AppStoreSoftstore\WorkBuddy`，其他机器要显式指定：
-
-```powershell
-$env:WB_INSTALL = "C:\Users\<你>\AppData\Local\Programs\WorkBuddy"
-```
-
-只在当前窗口有效。要长期生效就写进用户环境变量（写完重开窗口）：
-
-```powershell
-[Environment]::SetEnvironmentVariable("WB_INSTALL", "C:\Users\<你>\AppData\Local\Programs\WorkBuddy", "User")
-```
-
-Git Bash 里用 `export WB_INSTALL="..."`。
-
-## 4 先看
-
-```powershell
-python pojia.py status
-```
-
-要确认三件事：
+`install.bat` 自己会干完这些，中途不需要回答任何问题：
 
 ```
-安装目录   : D:\AppStoreSoftstore\WorkBuddy          ← 是不是你的
-插件缓存   : C:\Users\<你>\.workbuddy\plugins\cache\workbuddy-builtin  (存在)   ← 必须是"存在"
-人格目录   : C:\Users\<你>\.workbuddy\user-<id>-personal          ← 必须带长串 id
-...
-靶点合计 34 个（L0×1 + L8×15 + L1×11 + L2×2 + 人格×4 + L7×1）
+找 WorkBuddy 装在哪   注册表 → 运行中进程 → 标准安装位 → 扫本地盘
+记住路径              pojia.config.json，下次不用再找
+关掉正在运行的程序     3 秒倒计时，Ctrl+C 可取消
+体检靶点              L8/L1/L2 数量对不上就直接停，不乱写
+预演 → 写入           改哪个文件、增删多少字节，逐个打印
 ```
 
-**「靶点合计」本机是 34**。数字比这个小很多 → 安装目录指错了，或者 WorkBuddy 从没启动过（插件缓存是启动后才生成的），先启动一次再跑。
+## 没装 Python 3.9+
 
-## 5 装
-
-```powershell
-python pojia.py apply --dry-run    # 先看会改什么，不写任何文件
-python pojia.py apply              # 确认没问题再真装
-```
-
-每个靶点一行 `[Lx] 名字 ±字节`，末尾：
+双击后会提示。照这行装完，**关掉窗口重新双击**：
 
 ```
-装载完成：34 个靶点写入，0 个已是目标态。
+winget install -e --id Python.Python.3.12
 ```
 
-重复跑一次会是 `0 个靶点写入，34 个已是目标态`，这是正常的（幂等）。
+离线机器：装 [python.org](https://www.python.org/downloads/windows/) 的安装包，勾上 *Add python.exe to PATH*。
 
-## 6 生效 + 验收
+## 装不上
 
-```powershell
-# 完全退出再启动 —— L0 和 L8 都是启动时加载，只新开对话不够
-Get-Process WorkBuddy -EA SilentlyContinue | Stop-Process -Force
-```
+双击 **`doctor.bat`**，把输出贴出来。绝大多数是这三种：
 
-启动 WorkBuddy，新开一个对话说句话，然后：
-
-```powershell
-python pojia.py inspect
-```
-
-```
-样本：20 份请求体（trace_xxx.jsonl，10-29 20:28:50）
-L8/L1 新policy     20 / 20
-L8/L1 旧policy      0 / 20
-判定：L1/L8 已进入请求（新 policy 在，旧 policy 不在）。
-```
-
-退出码 `0` 才算装好。`3` = 请求里还是原厂 policy，回去查第 4 步那个插件缓存路径。
-
-## 7 日常
-
-| 情况 | 处理 |
+| 现象 | 处理 |
 |---|---|
-| WorkBuddy 升级后 | `apply`（在新版本基础上重算） |
-| 应用内改过设置 | 退出程序 → `apply` → 启动 |
-| 想还原 | `python pojia.py restore`，然后退出重启用 |
-| `apply` 报「封条缺失，但靶点已是改装态」 | 找回原来那份 `seal.json` 复用；确认要重来就加 `--force`（拿不到原厂基线，以后还原不了） |
+| `[!] Python 3.9+ not found` | 装 Python，关窗口重开再双击 |
+| `安装未完成，退出码 4` | 装在 `C:\Program Files` 下：右键 `install.bat` → 以管理员身份运行 |
+| `退出码 3` | 这台机器以前装过，但目录里缺 `seal.json`：找回它放进来重跑；找不到就 `install.bat --force`（之后还原不回原厂） |
 
-## 命令一览
+其余报错按 `DETAILS.md` 第 1 节逐条查。
 
-```powershell
-python pojia.py status              # 每层状态 + 靶点合计
-python pojia.py apply [--dry-run]   # 装载（--dry-run 只预览）
-python pojia.py verify [--runtime]  # 封条校验
-python pojia.py inspect             # 载荷有没有真的进请求（唯一可信验收）
-python pojia.py trace               # 各 trace 的命中表
-python pojia.py restore [--force]   # 还原到原厂
+## 想还原
+
+双击 **`restore.bat`**，然后退出并重启 WorkBuddy。
+
+## 想自己来
+
+```
+install.bat --dry-run     只体检，一个文件都不改
+python pojia.py setup     交互式向导（会逐个问你）
+python pojia.py status    看每层状态 + 靶点合计
+python pojia.py doctor    环境自检，15 项
+python pojia.py restore   还原
 ```
 
-故障排查、目录速查、八层靶点表、为什么文件里不能加标记，见 `DETAILS.md`；代码审查与回归记录见 `REVIEW.md`。
+`WB_INSTALL` 环境变量仍然有效（优先级最高），装在哪就填哪：`D:\你的\WorkBuddy`。贴 exe 路径、`...\resources` 也行，脚本会往上找。
+
+目录结构、八层靶点表、排查手册 → `DETAILS.md`；代码审查与实测记录 → `REVIEW.md` / `VERIFY.md`。
 
 ## License
 

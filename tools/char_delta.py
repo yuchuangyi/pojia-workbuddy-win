@@ -4,7 +4,9 @@
 import json
 import pathlib
 
-seal = json.load(open("seal.json", encoding="utf-8"))
+from _locate import seal_path
+
+seal = json.load(open(seal_path(), encoding="utf-8"))
 char_delta = {}
 for key, rec in seal["files"].items():
     bak = pathlib.Path(rec["backup"])

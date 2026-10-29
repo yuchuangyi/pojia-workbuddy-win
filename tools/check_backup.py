@@ -6,7 +6,9 @@ import json
 import pathlib
 import sys
 
-seal = json.load(open("seal.json", encoding="utf-8"))
+from _locate import seal_path
+
+seal = json.load(open(seal_path(), encoding="utf-8"))
 bad = 0
 per = {}
 for key, rec in seal["files"].items():
