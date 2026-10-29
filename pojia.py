@@ -40,6 +40,8 @@ PLUGIN_TPL = APP_UNPACKED / "resources" / "plugins" / "workbuddy-builtin" / "wel
 HOME = Path(os.environ.get("USERPROFILE", str(Path.home())))
 UD = HOME / ".workbuddy"
 APPCFG = UD / "app" / "app-config.json"
+# 插件缓存：welcomeMode 提示词实际是从这里加载的（版本化目录），安装目录那份只是同版本副本
+PLUGIN_CACHE = UD / "plugins" / "cache" / "workbuddy-builtin"
 SKILL_DIR = UD / "skills" / "pojia-mode"
 HERE = Path(__file__).resolve().parent
 BACKUP_ROOT = HERE / "backup"
@@ -244,9 +246,13 @@ def identity_tpls() -> list[Path]:
 
 
 def plugin_prompts() -> list[Path]:
-    if not PLUGIN_TPL.exists():
-        return []
-    return sorted(p for p in PLUGIN_TPL.glob("*/prompt.tpl") if p.is_file())
+    """welcomeMode(work/code/design) 实际使用的插件提示词：安装目录 + 版本化缓存。"""
+    out: list[Path] = []
+    if PLUGIN_TPL.exists():
+        out += sorted(p for p in PLUGIN_TPL.glob("*/prompt.tpl") if p.is_file())
+    if PLUGIN_CACHE.exists():
+        out += sorted(p for p in PLUGIN_CACHE.glob("welcomemode-*/**/prompt.tpl") if p.is_file())
+    return out
 
 
 def targets() -> list[dict]:
