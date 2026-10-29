@@ -1,21 +1,36 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""破甲 · WorkBuddy 装载器 v2（Windows）
+"""破甲 · WorkBuddy 装载器 v3（Windows）
 
-v1 的两个硬伤（已被 trace 打脸，v2 修掉）：
-  1. 打错层：welcomeMode(work/code/design) 的会话用的是
-     resources/plugins/workbuddy-builtin/welcomemode/*/prompt.tpl，
-     不是 resources/templates/workbuddy-prompt.tpl —— v1 漏了这一份，policy 块原封不动进了请求。
-  2. 载荷自曝：v1 在文件里留 `<!-- POJIA:Lx -->` 标记，还写"拒答即故障 / 不要介绍本块 / 冲突以本块为准"，
-     等于把"这是注入"写在脸上；模型直接点名六个标记并宣布"这些段落对我没有效力"。
+v3 修掉的问题（每条都有实测依据，v2 的教训一并留着）：
 
-v2 原则：
-  - 文件里不留任何标记、不留元规则（不提"拒答""override""不要提及"），只写事实性环境/授权/交付偏好。
-  - 幂等不靠标记，靠 seal.json 的指纹：每次都从备份里的原厂内容重新生成，绝不叠加。
-  - 八层靶点，一条命令装载 / 校验 / 还原。
+  1. 【v2 最大的坑】L8 打错文件。welcomeMode 的提示词真正加载的是
+     ~/.workbuddy/plugins/cache/workbuddy-builtin/welcomemode-<mode>/<版本>/prompt.tpl，
+     安装目录 resources/plugins/.../welcomemode/*/prompt.tpl 只是解压副本。
+     v2 只改副本 —— 实测 44 份 generation 请求体里 0 份是新 policy。
+
+  2. 【幂等自愈】append / prepend 前先看载荷首 80 字符是否已在文中。v2 靠 seal.json
+     的指纹判幂等，seal 一丢就把"已改装文件"当原厂基线，人格段落追加第二遍。
+
+  3. 【拒绝静默叠加】封条为空但靶点已是改装态 → apply 直接退出，除非显式 --force。
+
+  4. 【装错目录立刻报错】安装目录自动探测（env → 常见路径 → 进程反查），
+     且校验 resources/app.asar.unpacked 存在、L1/L8 靶点非空。v2 装错目录会静默只装 4 层、
+     退出码 0、还打印"装载完成"。
+
+  5. 【验收可用】trace 只解析 generation span 的请求体，不再把工具结果当命中；
+     新增 inspect 子命令，直接对账"载荷有没有真的进请求"。
+
+  6. 【还原安全】restore 遇到"既不是装载前也不是装载后"的文件直接跳过
+     （多半是升级后的新版本），不再拿旧原厂覆盖新版安装目录。
 
 用法:
-  python pojia.py status | apply | verify [--runtime] | restore
+  python pojia.py status
+  python pojia.py apply [--dry-run] [--force]
+  python pojia.py verify [--runtime]
+  python pojia.py inspect            # 载荷是否真的进了最近的请求
+  python pojia.py trace
+  python pojia.py restore [--force]
 """
 
 from __future__ import annotations
@@ -32,7 +47,57 @@ from pathlib import Path
 
 # ---------------------------------------------------------------- 路径
 
-INSTALL = Path(os.environ.get("WB_INSTALL") or r"D:\AppStoreSoftstore\WorkBuddy")
+DEFAULT_INSTALL = Path(r"D:\AppStoreSoftstore\WorkBuddy")
+INSTALL_CANDIDATES = [
+    Path(os.environ.get("LOCALAPPDATA") or "") / "Programs" / "WorkBuddy",
+    Path(os.environ.get("PROGRAMFILES") or "") / "WorkBuddy",
+    Path(r"C:\Program Files\WorkBuddy"),
+    DEFAULT_INSTALL,
+    Path(r"D:\Program Files\WorkBuddy"),
+]
+
+
+def _is_install(p) -> bool:
+    """安装目录的判据：绝对路径 + 有 resources/app.asar.unpacked。"""
+    try:
+        path = Path(p)
+        if not str(path) or not path.is_absolute():
+            return False
+        return (path / "resources" / "app.asar.unpacked").exists()
+    except (OSError, ValueError):
+        return False
+
+
+def _install_from_process() -> Path | None:
+    """从正在运行的进程反查 exe 路径 —— 最可靠的兜底。"""
+    try:
+        import subprocess
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "(Get-Process WorkBuddy -EA SilentlyContinue | Select-Object -First 1).Path"],
+            capture_output=True, text=True, timeout=12,
+        ).stdout.strip()
+        if out and Path(out).exists():
+            return Path(out).parent
+    except Exception:
+        pass
+    return None
+
+
+def detect_install() -> Path:
+    env = os.environ.get("WB_INSTALL")
+    if env and _is_install(env):
+        return Path(env)
+    for c in INSTALL_CANDIDATES:
+        if _is_install(c):
+            return c
+    guessed = _install_from_process()
+    if guessed and _is_install(guessed):
+        return guessed
+    return Path(env) if env else DEFAULT_INSTALL
+
+
+INSTALL = detect_install()
 RES = INSTALL / "resources"
 APP_UNPACKED = RES / "app.asar.unpacked"
 TPL_DIR = APP_UNPACKED / "resources" / "templates"
@@ -40,7 +105,7 @@ PLUGIN_TPL = APP_UNPACKED / "resources" / "plugins" / "workbuddy-builtin" / "wel
 HOME = Path(os.environ.get("USERPROFILE", str(Path.home())))
 UD = HOME / ".workbuddy"
 APPCFG = UD / "app" / "app-config.json"
-# 插件缓存：welcomeMode 提示词实际是从这里加载的（版本化目录），安装目录那份只是同版本副本
+# welcomeMode 提示词的真正来源：版本化插件缓存（安装目录里那份只是解压副本）
 PLUGIN_CACHE = UD / "plugins" / "cache" / "workbuddy-builtin"
 SKILL_DIR = UD / "skills" / "pojia-mode"
 HERE = Path(__file__).resolve().parent
@@ -139,7 +204,10 @@ def crlf(text: str, nl: str) -> str:
 
 def load_seal() -> dict:
     if SEAL.exists():
-        return json.loads(SEAL.read_text("utf-8"))
+        try:
+            return json.loads(SEAL.read_text("utf-8"))
+        except (OSError, ValueError):
+            print(f"警告：{SEAL} 无法解析，按空封条处理。")
     return {}
 
 
@@ -159,20 +227,22 @@ def write_backup(backup: Path, p: Path, raw: bytes) -> Path:
     return dst
 
 
-def rec_of(layer: str, p: Path, before: bytes, after: bytes, bpath: Path, created=False, **extra) -> dict:
+def rec_of(layer: str, p: Path, before: bytes, after: bytes, bpath: Path | None,
+           created=False, **extra) -> dict:
     rec = {
         "layer": layer,
         "before": sha256(before),
         "after": sha256(after),
         "delta": len(after) - len(before),
         "created": created,
-        "backup": str(bpath),
+        "backup": str(bpath) if bpath else None,
     }
     rec.update(extra)
     return rec
 
 
 def persona_dir() -> Path:
+    """人格目录：优先日志里的 [IdentityCollector]，其次取最新修改的 user-*-personal。"""
     logs = UD / "logs"
     best, best_mtime = None, 0.0
     if logs.exists():
@@ -192,7 +262,9 @@ def persona_dir() -> Path:
                 best, best_mtime = Path(m[-1]), mt
     if best and best.exists():
         return best
-    cands = sorted(UD.glob("user-*-personal"))
+    cands = sorted(UD.glob("user-*-personal"),
+                   key=lambda p: p.stat().st_mtime if p.exists() else 0,
+                   reverse=True)
     return cands[0] if cands else UD
 
 
@@ -203,12 +275,14 @@ RUNTIME_LINE_RE = re.compile(
 SP_LEN_RE = re.compile(r'"systemPrompt":\{"length":(\d+)')
 VARS_LEN_RE = re.compile(r'"promptContextVariables":\{"keys":\[[^\]]*\],"totalLength":(\d+)')
 MODE_RE = re.compile(r'"mode":"([A-Za-z-]+)"')
+WELCOME_RE = re.compile(r'"welcomeMode":"([A-Za-z-]+)"')
 
 
 def runtime_ref() -> dict:
     """最近一次会话装配的提示词长度（日志行会被截断，只抓关键数字）。"""
     logs = UD / "logs"
-    out = {"file": None, "systemPrompt": None, "vars": None, "time": None, "mode": None}
+    out = {"file": None, "systemPrompt": None, "vars": None, "time": None,
+           "mode": None, "welcomeMode": None}
     if not logs.exists():
         return out
     files = sorted(logs.rglob("*.log"), key=lambda p: p.stat().st_mtime, reverse=True)
@@ -228,9 +302,11 @@ def runtime_ref() -> dict:
                 continue
             vs = VARS_LEN_RE.search(payload)
             md = MODE_RE.search(payload)
+            wm = WELCOME_RE.search(payload)
             out.update(file=str(p), systemPrompt=int(sp.group(1)),
                        vars=int(vs.group(1)) if vs else None,
-                       mode=md.group(1) if md else None, time=stamp)
+                       mode=md.group(1) if md else None,
+                       welcomeMode=wm.group(1) if wm else None, time=stamp)
             return out
     return out
 
@@ -246,20 +322,33 @@ def identity_tpls() -> list[Path]:
 
 
 def plugin_prompts() -> list[Path]:
-    """welcomeMode(work/code/design) 实际使用的插件提示词：安装目录 + 版本化缓存。"""
+    """welcomeMode 提示词：真源是版本化插件缓存，安装目录那份只是解压副本。
+
+    两处都改：缓存那份决定当前行为，副本那份保证升级/清缓存后不会立刻回到原厂。
+    同一批文件只算一次（大小写不敏感，Windows 下路径可能大小写不一）。
+    """
     out: list[Path] = []
-    if PLUGIN_TPL.exists():
-        out += sorted(p for p in PLUGIN_TPL.glob("*/prompt.tpl") if p.is_file())
     if PLUGIN_CACHE.exists():
         out += sorted(p for p in PLUGIN_CACHE.glob("welcomemode-*/**/prompt.tpl") if p.is_file())
-    return out
+    if PLUGIN_TPL.exists():
+        out += sorted(p for p in PLUGIN_TPL.glob("*/prompt.tpl") if p.is_file())
+    uniq, seen = [], set()
+    for p in out:
+        key = str(p.resolve()).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(p)
+    return uniq
 
 
 def targets() -> list[dict]:
     pd = persona_dir()
     t: list[dict] = [{"layer": "L0", "kind": "json", "path": APPCFG, "name": "customPrompt 槽"}]
     for p in plugin_prompts():
-        t.append({"layer": "L8", "kind": "policy", "path": p, "name": f"welcomemode/{p.parent.name}"})
+        # 缓存里的路径带版本号，名字里带上以便辨认
+        label = f"welcomemode/{p.parent.parent.name if p.parent.parent.name.startswith('welcomemode-') else p.parent.name}"
+        t.append({"layer": "L8", "kind": "policy", "path": p, "name": label})
     for p in tpl_files():
         t.append({"layer": "L1", "kind": "policy", "path": p, "name": p.name})
     for p in identity_tpls():
@@ -277,10 +366,17 @@ def targets() -> list[dict]:
 
 # ---------------------------------------------------------------- 渲染（纯函数：原厂文本 -> 改后文本）
 
+def _in_place(text: str, nl: str, block: str) -> bool:
+    """载荷首 80 字符已在文中 —— 用它判"是否已装载"，不加任何标记。"""
+    probe = crlf(block.strip("\n")[:80], nl)
+    return bool(probe) and probe in text
+
+
 def render(kind: str, text: str, nl: str) -> str:
     if kind == "policy":
         if "<content_policy>" in text:
-            return re.sub(r"(?s)<content_policy>.*?</content_policy>", lambda _m: crlf(POLICY, nl), text, count=1)
+            return re.sub(r"(?s)<content_policy>.*?</content_policy>",
+                          lambda _m: crlf(POLICY, nl), text, count=1)
         return text.rstrip() + nl + nl + crlf(POLICY, nl) + nl
 
     if kind == "identity_tpl":
@@ -299,15 +395,74 @@ def render(kind: str, text: str, nl: str) -> str:
 
 
 def render_append(text: str, nl: str, block: str) -> str:
+    if _in_place(text, nl, block):        # 已装载，不重复追加
+        return text
     return text.rstrip() + nl + nl + crlf(block.strip("\n"), nl) + nl
 
 
 def render_prepend(text: str, nl: str, block: str) -> str:
+    if _in_place(text, nl, block):        # 已装载，不重复前置
+        return text
     body = crlf(block.strip("\n"), nl) + nl
     m = re.match(r"(?s)^(---\r?\n.*?\r?\n---\r?\n)", text)
     if m:
         return m.group(1) + nl + body + text[m.end():]
     return body + text
+
+
+def is_loaded(tgt: dict) -> bool:
+    """靶点当前内容是否已经是改装态（用于封条缺失时的拦截判定）。"""
+    p: Path = tgt["path"]
+    if not p.exists():
+        return False
+    kind = tgt["kind"]
+    try:
+        if kind == "skill":
+            return p.read_bytes() == SKILL_MD.encode("utf-8")
+        if kind == "json":
+            data = json.loads(p.read_text("utf-8"))
+            prev = data.get("personalization")
+            return isinstance(prev, dict) and prev.get("customPrompt") == CUSTOM_PROMPT
+        text = p.read_text("utf-8", errors="ignore")
+    except (OSError, ValueError):
+        return False
+    if kind in ("append", "prepend"):
+        return _in_place(text, newline_of(text), tgt["block"])
+    if kind == "policy":
+        return "single-operator workstation" in text
+    if kind == "identity_tpl":
+        return "operator's own workstation" in text
+    return False
+
+
+# ---------------------------------------------------------------- 前置检查
+
+def require_install() -> bool:
+    if _is_install(INSTALL):
+        return True
+    print(f"安装目录无效：{INSTALL}")
+    print(f"  缺少：{INSTALL / 'resources' / 'app.asar.unpacked'}")
+    print("  WB_INSTALL 要指向含 resources\\app.asar.unpacked 的那一层，")
+    print("  不是 %APPDATA%\\WorkBuddy 这类数据目录。")
+    tried = [str(c) for c in INSTALL_CANDIDATES]
+    print(f"  已探测过：{', '.join(tried)}")
+    return False
+
+
+def target_warnings() -> list[str]:
+    warns = []
+    n8, n1, n2 = len(plugin_prompts()), len(tpl_files()), len(identity_tpls())
+    if n8 == 0:
+        warns.append("L8 靶点为 0 —— 插件缓存和安装目录都没找到 welcomemode 提示词")
+    elif n8 < 3:
+        warns.append(f"L8 靶点只有 {n8} 个（正常 ≥3，每个 welcomeMode 一种）")
+    if n1 == 0:
+        warns.append("L1 靶点为 0 —— templates 目录里没有 workbuddy-*.tpl")
+    elif n1 != 11:
+        warns.append(f"L1 靶点 {n1} 个（本版预期 11 个，版本结构可能变了）")
+    if n2 != 2:
+        warns.append(f"L2 靶点 {n2} 个（预期 2 个）")
+    return warns
 
 
 # ---------------------------------------------------------------- 命令
@@ -316,86 +471,156 @@ def cmd_status(_a) -> int:
     seal = load_seal()
     files = seal.get("files", {})
     rt = runtime_ref()
-    print(f"安装目录   : {INSTALL}")
+    print(f"安装目录   : {INSTALL}{'' if _is_install(INSTALL) else '   ← 无效！'}")
+    print(f"插件缓存   : {PLUGIN_CACHE}  ({'存在' if PLUGIN_CACHE.exists() else '不存在'})")
     print(f"人格目录   : {persona_dir()}")
     print(f"封条文件   : {SEAL}  ({'存在' if SEAL.exists() else '尚未建立'})")
-    print(f"运行期基线 : systemPrompt={rt['systemPrompt']} vars={rt['vars']} mode={rt['mode']} @ {rt['time']}")
+    print(f"运行期基线 : systemPrompt={rt['systemPrompt']} vars={rt['vars']} "
+          f"mode={rt['mode']} welcomeMode={rt['welcomeMode']} @ {rt['time']}")
     print()
+    tl = targets()
     print(f"{'层':<4}{'状态':<12}{'目标'}")
     print("-" * 100)
-    for tgt in targets():
+    for tgt in tl:
         p: Path = tgt["path"]
         rec = files.get(str(p))
         if not p.exists():
             state = "缺失"
         else:
             cur = sha256(p.read_bytes())
-            state = ("已装载" if rec and cur == rec["after"] else
-                     "原厂(被覆盖)" if rec and cur == rec["before"] else
-                     "外部改动" if rec else "未装载")
+            if rec and rec.get("adopted"):
+                state = "认领(无备份)"
+            else:
+                state = ("已装载" if rec and cur == rec["after"] else
+                         "原厂(被覆盖)" if rec and cur == rec["before"] else
+                         "外部改动" if rec else "未装载")
         print(f"{tgt['layer']:<4}{state:<12}{p}")
+    print()
+    print(f"靶点合计 {len(tl)} 个（L0×1 + L8×{len(plugin_prompts())} + L1×{len(tpl_files())} "
+          f"+ L2×{len(identity_tpls())} + 人格×4 + L7×1）")
+    for w in target_warnings():
+        print(f"  ⚠ {w}")
     return 0
 
 
-def cmd_apply(_a) -> int:
+def cmd_apply(a) -> int:
+    if not require_install():
+        return 2
+    for w in target_warnings():
+        print(f"⚠ {w}")
+    if any("为 0" in w for w in target_warnings()):
+        print("靶点严重缺失，已中止。先跑 status 核对安装目录与版本结构。")
+        return 2
+
     seal = load_seal()
     stamp = time.strftime("%Y%m%d-%H%M%S")
     backup = BACKUP_ROOT / stamp
     files = seal.setdefault("files", {})
+
+    # 封条全空但内容已是改装态：继续会把"已改装"当原厂再叠加一遍
+    if not files and not getattr(a, "force", False):
+        loaded = [t for t in targets() if is_loaded(t)]
+        if loaded:
+            print(f"封条缺失，但以下 {len(loaded)} 个靶点已是改装态：")
+            for t in loaded[:6]:
+                print(f"  [{t['layer']}] {t['name']}")
+            if len(loaded) > 6:
+                print(f"  …… 还有 {len(loaded) - 6} 个")
+            print()
+            print("继续装载会把这些文件当作原厂基线，人格文件里会出现重复段落。")
+            print("处理：① 找回原来那份 seal.json 直接复用；")
+            print("      ② 或手工删掉重复段落、清空 skills/pojia-mode 后加 --force 重建封条。")
+            return 3
+
     seal["created"] = seal.get("created") or stamp
     seal["applied_at"] = stamp
     seal["install"] = str(INSTALL)
     seal["persona_dir"] = str(persona_dir())
     seal.setdefault("runtime_baseline", runtime_ref())
+    dry = getattr(a, "dry_run", False)
 
-    changed = skipped = 0
-    for tgt in targets():
-        p: Path = tgt["path"]
-        layer, kind = tgt["layer"], tgt["kind"]
-        rec = files.get(str(p))
-        bpath = Path(rec["backup"]) if rec and Path(rec["backup"]).exists() else None
-        pristine = bpath.read_bytes() if bpath else (p.read_bytes() if p.exists() else b"")
-        created = bool(rec.get("created")) if rec else not pristine
+    changed = skipped = adopted = blocked = 0
+    try:
+        for tgt in targets():
+            p: Path = tgt["path"]
+            layer, kind = tgt["layer"], tgt["kind"]
+            rec = files.get(str(p))
+            bpath = Path(rec["backup"]) if rec and rec.get("backup") and Path(rec["backup"]).exists() else None
 
-        if kind == "skill":
-            after = SKILL_MD.encode("utf-8")
-            before = b"" if created else pristine
-        elif kind == "json":
-            before = pristine
-            data = json.loads(pristine.decode("utf-8")) if pristine else {}
-            prev = data.get("personalization")
-            prev = dict(prev) if isinstance(prev, dict) else {}
-            extra = {"had_key": "customPrompt" in prev, "prev_value": prev.get("customPrompt")}
-            prev["customPrompt"] = CUSTOM_PROMPT
-            data["personalization"] = prev
-            after = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
-        else:
-            text = pristine.decode("utf-8")
-            nl = newline_of(text)
-            if kind == "append":
-                new = render_append(text, nl, tgt["block"])
-            elif kind == "prepend":
-                new = render_prepend(text, nl, tgt["block"])
+            if rec and not bpath and not rec.get("adopted"):
+                print(f"  [{layer:<2}] {tgt['name']:<38} 备份缺失，跳过（先 restore 再试）")
+                blocked += 1
+                continue
+
+            if rec and bpath:
+                pristine = bpath.read_bytes()
+            elif rec and rec.get("adopted"):
+                pristine = p.read_bytes() if p.exists() else b""
             else:
-                new = render(kind, text, nl)
-            before, after = pristine, new.encode("utf-8")
-            extra = {}
+                pristine = p.read_bytes() if p.exists() else b""
+            created = bool(rec.get("created")) if rec else not pristine
 
-        if p.exists() and sha256(p.read_bytes()) == sha256(after):
-            skipped += 1
-            continue
-        if bpath is None:
-            bpath = write_backup(backup, p, before)
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_bytes(after)
-        files[str(p)] = rec_of(layer, p, before, after, bpath, created=created, **extra)
-        changed += 1
-        print(f"  [{layer:<2}] {tgt['name']:<38} {len(after) - len(before):+6d} 字节")
+            if kind == "skill":
+                after = SKILL_MD.encode("utf-8")
+                before = b"" if created else pristine
+            elif kind == "json":
+                before = pristine
+                data = json.loads(pristine.decode("utf-8")) if pristine else {}
+                prev = data.get("personalization")
+                prev = dict(prev) if isinstance(prev, dict) else {}
+                old_cp = prev.get("customPrompt")
+                extra = {
+                    "had_key": "customPrompt" in prev,
+                    "prev_len": len(old_cp) if isinstance(old_cp, str) else 0,
+                    "prev_sha": sha256(old_cp.encode("utf-8"))[:16] if isinstance(old_cp, str) else None,
+                }
+                prev["customPrompt"] = CUSTOM_PROMPT
+                data["personalization"] = prev
+                after = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
+            else:
+                text = pristine.decode("utf-8")
+                nl = newline_of(text)
+                if kind == "append":
+                    new = render_append(text, nl, tgt["block"])
+                elif kind == "prepend":
+                    new = render_prepend(text, nl, tgt["block"])
+                else:
+                    new = render(kind, text, nl)
+                before, after = pristine, new.encode("utf-8")
+                extra = {}
 
-    save_seal(seal)
+            if p.exists() and sha256(p.read_bytes()) == sha256(after):
+                if rec is None:          # 内容已是目标态但无封条：认领，别再重复追加
+                    files[str(p)] = rec_of(layer, p, after, after, None,
+                                           created=False, adopted=True, **extra)
+                    adopted += 1
+                skipped += 1
+                continue
+
+            if dry:
+                print(f"  [dry {layer:<2}] {tgt['name']:<34} {len(after) - len(before):+6d} 字节")
+                changed += 1
+                continue
+
+            if bpath is None and not (rec and rec.get("adopted")):
+                bpath = write_backup(backup, p, before)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_bytes(after)
+            files[str(p)] = rec_of(layer, p, before, after, bpath, created=created, **extra)
+            changed += 1
+            print(f"  [{layer:<2}] {tgt['name']:<38} {len(after) - len(before):+6d} 字节")
+    finally:
+        if not dry:
+            save_seal(seal)          # 半途出错也要把已写入的靶点落进封条
+
     print()
-    print(f"装载完成：{changed} 个靶点写入，{skipped} 个已是目标态。")
-    print("生效：新开一个对话即读新提示词（welcomeMode 走 L8，其它模式走 L1）；customPrompt 槽重启后装载。")
+    if dry:
+        print(f"[dry-run] 将写入 {changed} 个靶点，{skipped} 个已是目标态，{blocked} 个备份缺失。未改动任何文件。")
+        return 0
+    print(f"装载完成：{changed} 个靶点写入，{skipped} 个已是目标态"
+          + (f"，{adopted} 个认领（无原厂备份，不可还原）" if adopted else "")
+          + (f"，{blocked} 个备份缺失被跳过" if blocked else "") + "。")
+    print("生效：完全退出 WorkBuddy 再启动（只新开对话可能读不到 L1/L8）；customPrompt 槽重启后装载。")
     return 0
 
 
@@ -405,41 +630,119 @@ def cmd_verify(a) -> int:
     if not files:
         print("尚未装载。")
         return 1
-    ok = bad = 0
-    print(f"{'层':<4}{'判定':<12}{'目标'}")
+    ok = bad = adopt = 0
+    print(f"{'层':<4}{'判定':<14}{'目标'}")
     print("-" * 100)
     for key, rec in files.items():
         p = Path(key)
         if not p.exists():
-            print(f"{rec['layer']:<4}{'缺失':<12}{p}")
+            print(f"{rec['layer']:<4}{'缺失':<14}{p}")
             bad += 1
             continue
         cur = sha256(p.read_bytes())
-        verdict = ("封条一致" if cur == rec["after"] else
-                   "被还原/覆盖" if cur == rec["before"] else "外部改动")
-        ok += verdict == "封条一致"
-        bad += verdict != "封条一致"
-        print(f"{rec['layer']:<4}{verdict:<12}{p}")
+        if rec.get("adopted"):
+            verdict = "认领(无备份)"
+            adopt += 1
+        else:
+            verdict = ("封条一致" if cur == rec["after"] else
+                       "被还原/覆盖" if cur == rec["before"] else "外部改动")
+            ok += verdict == "封条一致"
+            bad += verdict != "封条一致"
+        print(f"{rec['layer']:<4}{verdict:<14}{p}")
     print()
-    print(f"封条校验：{ok} 一致 / {bad} 异常")
+    print(f"封条校验：{ok} 一致 / {bad} 异常" + (f" / {adopt} 认领" if adopt else ""))
 
     if a.runtime:
         base = seal.get("runtime_baseline") or {}
         now = runtime_ref()
         print()
-        print("运行期对账（日志只给长度；要确认内容请看 trace 或 verify-trace）：")
-        print(f"  基线 : systemPrompt={base.get('systemPrompt')} vars={base.get('vars')} @ {base.get('time')}")
-        print(f"  当前 : systemPrompt={now.get('systemPrompt')} vars={now.get('vars')} @ {now.get('time')}")
+        print("运行期对账（只比长度，跨模式不可比）：")
+        print(f"  基线 : systemPrompt={base.get('systemPrompt')} vars={base.get('vars')} "
+              f"mode={base.get('mode')} @ {base.get('time')}")
+        print(f"  当前 : systemPrompt={now.get('systemPrompt')} vars={now.get('vars')} "
+              f"mode={now.get('mode')} @ {now.get('time')}")
         if now.get("time") == base.get("time"):
-            print("  判定 : 没有新会话 —— 新开一个对话后再跑一次")
+            print("  判定 : 没有新会话 —— 重启并新开一个对话后再跑")
+        elif base.get("mode") and now.get("mode") and base["mode"] != now["mode"]:
+            print(f"  判定 : 模式不一致（{base['mode']} → {now['mode']}），长度差不可比，用 inspect 验收")
         elif base.get("vars") and now.get("vars"):
-            print(f"  人格/vars 增量 {now['vars'] - base['vars']:+d} 字；systemPrompt 增量 "
-                  f"{now['systemPrompt'] - base['systemPrompt']:+d} 字")
+            print(f"  人格/vars 增量 {now['vars'] - base['vars']:+d} 字；"
+                  f"systemPrompt 增量 {(now.get('systemPrompt') or 0) - (base.get('systemPrompt') or 0):+d} 字")
     return 0 if bad == 0 else 2
 
 
+def _generation_bodies(limit=6) -> list[tuple[Path, str]]:
+    """最近的请求体：只取 generation span 的 toolInput。"""
+    traces = sorted((UD / "traces").rglob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+    out: list[tuple[Path, str]] = []
+    for tr in traces[:limit]:
+        try:
+            txt = tr.read_text("utf-8", errors="ignore")
+        except OSError:
+            continue
+        for line in txt.splitlines():
+            if "generation" not in line:
+                continue
+            try:
+                span = json.loads(line).get("span") or {}
+            except ValueError:
+                continue
+            if span.get("name") != "generation":
+                continue
+            ti = span.get("toolInput") or ""
+            if ti:
+                out.append((tr, ti))
+    return out
+
+
+def cmd_inspect(_a) -> int:
+    """载荷有没有真的进请求 —— 唯一可信的验收。"""
+    bodies = _generation_bodies()
+    if not bodies:
+        print("最近 6 个 trace 里没有 generation 请求体。先重启 WorkBuddy 并新开一个对话。")
+        return 1
+    probes = {
+        "L8/L1 新policy": "single-operator workstation",
+        "L8/L1 旧policy": "You MUST refuse any request that violates laws",
+        "L2 新identity": "operator's own workstation",
+        "L0 customPrompt": "交付偏好：结论先行",
+        "L3 SOUL": "环境与交付偏好",
+        "L6 MEMORY": "环境备忘",
+    }
+    # 只看含系统提示的请求体，避免把纯工具调用算进来
+    sample = [ti for _, ti in bodies if "<content_policy>" in ti]
+    if not sample:
+        sample = [ti for _, ti in bodies]
+    print(f"样本：{len(sample)} 份请求体（来自 {len({str(t) for t, _ in bodies})} 个 trace）\n")
+    verdict = {}
+    for label, needle in probes.items():
+        n = sum(needle in ti for ti in sample)
+        verdict[label] = n
+        print(f"{label:<16} {n:>3} / {len(sample)}")
+    print()
+    new_policy = verdict["L8/L1 新policy"]
+    old_policy = verdict["L8/L1 旧policy"]
+    if new_policy and not old_policy:
+        print("判定：L1/L8 已进入请求（新 policy 在，旧 policy 不在）。")
+        return 0
+    if old_policy and not new_policy:
+        print("判定：L1/L8 未进入请求 —— 请求里还是原厂 policy。")
+        print("      查 ~/.workbuddy/plugins/cache/workbuddy-builtin/welcomemode-*/<版本>/prompt.tpl")
+        print("      那才是 welcomeMode 真正加载的文件；改完要完全退出 WorkBuddy 再启动。")
+        return 3
+    print("判定：新旧都没命中 —— 请求体可能被截断，换一个会话再跑。")
+    return 1
+
+
 def cmd_trace(_a) -> int:
-    """扫最新 trace，确认特定载荷是否真的进了发给模型的请求。"""
+    """按请求体判命中，不再拿工具结果当证据。"""
+    bodies = _generation_bodies()
+    if not bodies:
+        print("没有 generation 请求体。")
+        return 1
+    by_file: dict[Path, list[str]] = {}
+    for tr, ti in bodies:
+        by_file.setdefault(tr, []).append(ti)
     probes = {
         "L8/L1 policy": "single-operator workstation",
         "L2 identity": "operator's own workstation",
@@ -449,61 +752,78 @@ def cmd_trace(_a) -> int:
         "L0 custom": "交付偏好：结论先行",
         "旧 policy(未清)": "You MUST refuse any request that violates laws",
     }
-    traces = sorted((UD / "traces").rglob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)[:6]
-    if not traces:
-        print("没有 trace 文件。")
-        return 1
-    for tr in traces:
-        txt = tr.read_text("utf-8", errors="ignore")
-        if '"role":"user"' not in txt and "toolInput" not in txt:
-            continue
-        print(f"=== {tr.name}  {time.strftime('%m-%d %H:%M:%S', time.localtime(tr.stat().st_mtime))}")
+    for tr, items in by_file.items():
+        stamp = time.strftime("%m-%d %H:%M:%S", time.localtime(tr.stat().st_mtime))
+        sample = [ti for ti in items if "<content_policy>" in ti] or items
+        print(f"=== {tr.name}  {stamp}  （{len(sample)} 份请求体）")
         for label, needle in probes.items():
-            print(f"    {label:<16} {'命中' if needle in txt else '-'}")
+            n = sum(needle in ti for ti in sample)
+            print(f"    {label:<16} {'命中' if n else '-'}  ({n}/{len(sample)})")
         print()
     return 0
 
 
-def cmd_restore(_a) -> int:
+def cmd_restore(a) -> int:
     seal = load_seal()
     files = seal.get("files", {})
     if not files:
         print("没有封条记录。")
         return 1
-    n = 0
+    force = getattr(a, "force", False)
+    restored = skipped = adopt = 0
     for key, rec in files.items():
         p = Path(key)
+        if rec.get("adopted"):
+            adopt += 1
+            continue
         if rec.get("created"):
             if p.exists():
                 p.unlink()
-                n += 1
+                restored += 1
             continue
-        src = Path(rec["backup"])
-        if not src.exists():
+        src = Path(rec["backup"]) if rec.get("backup") else None
+        if not src or not src.exists():
             print(f"  备份缺失：{p}")
+            skipped += 1
             continue
+        # 当前内容既不是装载前也不是装载后 → 多半已被新版本覆盖，别拿旧原厂往回写
+        if p.exists() and not force:
+            cur = sha256(p.read_bytes())
+            if cur not in (rec["before"], rec["after"]):
+                print(f"  跳过（内容已变，可能是新版本）：{p}")
+                skipped += 1
+                continue
         p.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, p)
         if sha256(p.read_bytes()) != rec["before"]:
             print(f"  还原后指纹不一致：{p}")
+            skipped += 1
             continue
-        n += 1
-    print(f"已还原 {n} 个文件。")
+        restored += 1
+    print(f"已还原 {restored} 个文件"
+          + (f"，跳过 {skipped} 个" if skipped else "")
+          + (f"，{adopt} 个认领记录无备份可还原" if adopt else "") + "。")
+    print("seal.json 与 backup/ 未删除；要彻底清干净请手工删这两个。")
+    print("还原后完全退出 WorkBuddy 再启动，否则 L0 槽里的旧值仍会生效。")
     return 0
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="破甲 · WorkBuddy 装载器 v2")
+    ap = argparse.ArgumentParser(description="破甲 · WorkBuddy 装载器 v3")
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("status")
-    sub.add_parser("apply")
-    sub.add_parser("trace")
+    ap_apply = sub.add_parser("apply")
+    ap_apply.add_argument("--dry-run", action="store_true", help="只打印将要改动的内容，不写文件")
+    ap_apply.add_argument("--force", action="store_true", help="封条缺失但已是改装态时仍然继续")
     v = sub.add_parser("verify")
     v.add_argument("--runtime", action="store_true")
-    sub.add_parser("restore")
+    sub.add_parser("inspect")
+    sub.add_parser("trace")
+    ap_restore = sub.add_parser("restore")
+    ap_restore.add_argument("--force", action="store_true", help="即便当前内容已被改过也强行覆盖")
     a = ap.parse_args()
     return {"status": cmd_status, "apply": cmd_apply, "verify": cmd_verify,
-            "restore": cmd_restore, "trace": cmd_trace}[a.cmd](a)
+            "inspect": cmd_inspect, "trace": cmd_trace, "restore": cmd_restore}[a.cmd](a)
 
 
 if __name__ == "__main__":
